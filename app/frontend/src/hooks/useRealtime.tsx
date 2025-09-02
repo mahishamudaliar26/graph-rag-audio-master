@@ -113,7 +113,7 @@ export default function useRealTime({
 
         try {
             sendJsonMessage(command);
-            // console.log("📤 Audio chunk sent, size:", base64Audio.length);
+            // console.log("📤 Audio content sent, size:", base64Audio.length);
         } catch (error) {
             console.error("❌ Failed to send audio:", error);
         }

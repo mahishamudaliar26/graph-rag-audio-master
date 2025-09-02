@@ -53,7 +53,7 @@ export default function useAudioPlayer() {
             const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
             const pcmData = new Int16Array(bytes.buffer);
 
-            console.log("🔊 Playing audio chunk, size:", pcmData.length);
+            console.log("🔊 Playing audio content, size:", pcmData.length);
             audioPlayer.current.play(pcmData);
         } catch (error) {
             console.error("❌ Error playing audio:", error);

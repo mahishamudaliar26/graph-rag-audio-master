@@ -73,5 +73,5 @@ export type ExtensionMiddleTierToolResponse = {
 };
 
 export type ToolResult = {
-    sources: { chunk_id: string; title: string; chunk: string; transcript?: string }[];
+    sources: { chunk: string; title: string; content: string; transcript?: string }[];
 };

@@ -1,10 +1,14 @@
 import re
+import os
 from typing import Any
 from azure.identity import DefaultAzureCredential
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import VectorizableTextQuery
+from azure.search.documents.models import VectorizedQuery
+from openai import AsyncAzureOpenAI 
 from rtmt import RTMiddleTier, Tool, ToolResult, ToolResultDirection
+
 
 _search_tool_schema = {
     "type": "function",
@@ -24,6 +28,7 @@ _search_tool_schema = {
         "additionalProperties": False
     }
 }
+
 
 _grounding_tool_schema = {
     "type": "function",
@@ -47,44 +52,96 @@ _grounding_tool_schema = {
     }
 }
 
+
+def create_openai_client() -> AsyncAzureOpenAI:
+    return AsyncAzureOpenAI(
+        azure_endpoint=os.environ.get("AZURE_OPENAI_ENDPOINT"),
+        api_version=os.environ.get("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+        api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
+    )
+
+
 async def _search_tool(search_client: SearchClient, args: Any) -> ToolResult:
     print(f"Searching for '{args['query']}' in the knowledge base.")
-    # Hybrid + Reranking query using Azure AI Search
+
+    openai_client = create_openai_client()
+    
+    # FIX: Add await here
+    embeddings_response = await openai_client.embeddings.create(
+        input=args['query'],
+        model=os.environ.get("AZURE_OPENAI_EMBEDDING_MODEL_NAME", "text-embedding-ada-002")
+    )
+
+    query_embedding = embeddings_response.data[0].embedding
+
+    # FIX: Add await here
     search_results = await search_client.search(
-        search_text=args['query'], 
+        search_text=None,
+        vector_queries=[
+            VectorizedQuery(
+                vector=query_embedding,
+                k_nearest_neighbors=50,
+                fields="content_vector",
+            )
+        ],
         query_type="semantic",
         top=5,
-        vector_queries=[VectorizableTextQuery(text=args['query'], k_nearest_neighbors=50, fields="text_vector")],
-        select="chunk_id,title,chunk")
+        select="chunk,title,content"
+    )
+    
     result = ""
     async for r in search_results:
-        result += f"[{r['chunk_id']}]: {r['chunk']}\n-----\n"
+        result += f"[{r['chunk']}]: {r['content']}\n-----\n"    
     return ToolResult(result, ToolResultDirection.TO_SERVER)
+
 
 KEY_PATTERN = re.compile(r'^[a-zA-Z0-9_=\-]+$')
 
 # TODO: move from sending all chunks used for grounding eagerly to only sending links to 
 # the original content in storage, it'll be more efficient overall
-async def _report_grounding_tool(search_client: SearchClient, args: Any) -> None:
+async def _report_grounding_tool(search_client: SearchClient, args: Any) -> ToolResult:  # Fixed return type
     sources = [s for s in args["sources"] if KEY_PATTERN.match(s)]
-    list = " OR ".join(sources)
-    print(f"Grounding source: {list}")
-    # Use search instead of filter to align with how detailt integrated vectorization indexes
-    # are generated, where chunk_id is searchable with a keyword tokenizer, not filterable 
-    search_results = await search_client.search(search_text=list, 
-                                                search_fields=["chunk_id"], 
-                                                select=["chunk_id", "title", "chunk"], 
-                                                top=len(sources), 
-                                                query_type="full")
+    source_list = " OR ".join(sources)  # Renamed from 'list' to avoid builtin conflict
+    print(f"Grounding source: {source_list}")
     
-    # If your index has a key field that's filterable but not searchable and with the keyword analyzer, you can 
-    # use a filter instead (and you can remove the regex check above, just ensure you escape single quotes)
-    # search_results = await search_client.search(filter=f"search.in(chunk_id, '{list}')", select=["chunk_id", "title", "chunk"])
+    # Since chunk is Int32, we need to convert sources to integers and use proper filtering
+    try:
+        # Convert sources to integers (assuming they are numeric chunk IDs)
+        chunk_ids = [int(s) for s in sources if s.isdigit()]
+        
+        if not chunk_ids:
+            return ToolResult({"sources": []}, ToolResultDirection.TO_CLIENT)
+        
+        # Build filter for integer chunk field
+        if len(chunk_ids) == 1:
+            filter_expr = f"chunk eq {chunk_ids[0]}"
+        else:
+            # For multiple values, use OR conditions
+            filter_conditions = [f"chunk eq {chunk_id}" for chunk_id in chunk_ids]
+            filter_expr = " or ".join(filter_conditions)
+        
+        search_results = await search_client.search(
+            filter=filter_expr,
+            select=["chunk", "title", "content"]  # Fixed: removed duplicate "chunk"
+        )
 
-    docs = []
-    async for r in search_results:
-        docs.append({"chunk_id": r['chunk_id'], "title": r["title"], "chunk": r['chunk']})
-    return ToolResult({"sources": docs}, ToolResultDirection.TO_CLIENT)
+        docs = []
+        async for r in search_results:
+            docs.append({
+                "chunk": str(r['chunk']),  # Convert back to string for consistency
+                "title": r["title"], 
+                "content": r['content']
+            })
+        
+        return ToolResult({"sources": docs}, ToolResultDirection.TO_CLIENT)
+        
+    except ValueError as e:
+        print(f"Error converting chunk IDs to integers: {e}")
+        return ToolResult({"sources": [], "error": "Invalid chunk IDs"}, ToolResultDirection.TO_CLIENT)
+    except Exception as e:
+        print(f"Error in grounding tool: {e}")
+        return ToolResult({"sources": [], "error": str(e)}, ToolResultDirection.TO_CLIENT)
+
 
 def attach_rag_tools(rtmt: RTMiddleTier, search_endpoint: str, search_index: str, credentials: AzureKeyCredential | DefaultAzureCredential) -> None:
     if not isinstance(credentials, AzureKeyCredential):

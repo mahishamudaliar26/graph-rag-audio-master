@@ -11,17 +11,17 @@ export default defineConfig({
         sourcemap: true
     },
     resolve: {
+        preserveSymlinks: true,
         alias: {
             "@": path.resolve(__dirname, "./src")
         }
     },
     server: {
-        host: true,
         proxy: {
-            "/": {
+            "/realtime": {
                 target: "ws://localhost:8000",
-                changeOrigin: true,
-                secure: false
+                ws: true,
+                rewriteWsOrigin: true
             }
         }
     }
